@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "NNCoxKL"
+version = "0.1.0"
+description = "Neural Cox survival models with external-risk regularization"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+    "numpy",
+    "optuna",
+    "scikit-learn",
+    "scikit-survival",
+    "pandas",
+    "matplotlib",
+]
+
+[project.urls]
+Repository = "https://github.com/UM-KevinHe/NNCoxKL"
+
+[tool.setuptools]
+packages = ["NNCoxKL"]

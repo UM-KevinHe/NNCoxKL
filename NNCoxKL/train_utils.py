@@ -105,7 +105,9 @@ def hyperparameter_tuning(train_set, val_set, model_base, param_grid, eta,
 
 def hyperparameter_tuning_optuna(train_set, val_set, model_base, param_ranges, eta=None,
                                  selection_criterion='loss', n_trials=50, seed=42,
-                                 num_epoch=300, patience=50, study_name=None):
+                                 num_epoch=300, patience=50, study_name=None,
+                                 metrics_class=None, initial_state_dict=None,
+                                 reset_batchnorm=False):
     """
     Hyperparameter tuning using Optuna framework for automatic hyperparameter selection.
     
@@ -248,12 +250,11 @@ def hyperparameter_tuning_optuna(train_set, val_set, model_base, param_ranges, e
         weight_decay = param_dict['weight_decay']
         num_layer = param_dict['num_layer']
         alpha = param_dict.get('alpha', 1.0)
+        ridge_lambda = param_dict.get('ridge_lambda', 0.0)
         
         # Extract eta: use from param_dict if tuned, otherwise use fixed eta
         trial_eta = param_dict.get('eta', eta)
         
-        # Create model and trainer with fresh initialization
-        # Use trial_seed to ensure each trial starts with different random state
         model = model_base(
             input_dim=train_set.X.shape[1],
             hidden_dim=hidden_dim,
@@ -262,14 +263,24 @@ def hyperparameter_tuning_optuna(train_set, val_set, model_base, param_ranges, e
             num_dr=num_dr,
             seed_value=trial_seed  # Pass trial-specific seed to model
         )
-        trainer = Trainer(model=model, weight_decay=weight_decay, seed=trial_seed)
-        
+        if initial_state_dict is not None:
+            model.load_state_dict(initial_state_dict)
+            if reset_batchnorm:
+                for module in model.modules():
+                    if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                        module.reset_running_stats()
+        trainer_kwargs = dict(model=model, weight_decay=weight_decay, seed=trial_seed)
+        if metrics_class is not None:
+            trainer_kwargs["metrics"] = metrics_class()
+        trainer = Trainer(**trainer_kwargs)
+
         # Train model
         _, val_loss_list = trainer.fit(
             train_set=train_set,
             val_set=val_set,
             eta_list=[trial_eta],
             alpha = alpha,
+            ridge_lambda=ridge_lambda,
             batch_size=batch_size,
             num_epoch=num_epoch,
             learning_rate=learning_rate,
@@ -428,7 +439,9 @@ class Trainer:
         self.model = model
         if metrics is None:
             self.metrics = CoxKLLOSS()
-        
+        else:
+            self.metrics = metrics
+
         if device is None or device == 'cuda':
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             print(f'use pytorch-cuda for training on {self.device}')
@@ -483,12 +496,26 @@ class Trainer:
             **kwargs):
         
         self.set_lr(learning_rate)
+        alpha = kwargs.get('alpha', 1.0)
+        ridge_lambda = kwargs.get('ridge_lambda', 0.0)
+        original_weight_decay = [pg.get('weight_decay', 0.0) for pg in self.optimizer.param_groups]
+        if ridge_lambda > 0.0:
+            for param_group in self.optimizer.param_groups:
+                param_group['weight_decay'] = 0.0
 
         # train_data1 = Data(x_train, y_train, delta_tilde1)
-        self.train_dataloader = DataLoader(dataset=train_set, batch_size=batch_size, shuffle=True, drop_last=True)
+        if batch_size <= 0:
+            batch_size = len(train_set)
+        train_drop_last = batch_size < len(train_set)
+        self.train_dataloader = DataLoader(
+            dataset=train_set,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=train_drop_last,
+        )
 
         if val_set is not None:
-            self.val_dataloader = DataLoader(dataset=val_set, batch_size=len(val_set), shuffle=False, drop_last=True)
+            self.val_dataloader = DataLoader(dataset=val_set, batch_size=len(val_set), shuffle=False, drop_last=False)
 
         if eval_c_index:
             self.train_dataloader_full = DataLoader(dataset=train_set, batch_size=len(train_set), shuffle=False, drop_last=True)
@@ -503,7 +530,7 @@ class Trainer:
         early_stopping_message_printed = False
         early_stopping_epoch = 0
 
-        self.metrics = CoxKLLOSS()
+        self.metrics = self.metrics.to(self.device)
 
 
         train_loss_list, val_loss_list = [], []
@@ -518,79 +545,97 @@ class Trainer:
             c_index_test_list.append((0, c_index_test))  # Store epoch (0) and C-index
             loss_test_list.append((0, loss_test))  # Store epoch (0) and loss
 
-        for epoch in range(num_epoch):
-            self.model.train()
-            running_loss = 0.0
+        try:
+            for epoch in range(num_epoch):
+                self.model.train()
+                running_loss = 0.0
 
-            for _, data in enumerate(self.train_dataloader, 0):
-                inputs, target, delta_tilde_tmp = [d.to(self.device) for d in data]
-                event, time = target[:, 0], target[:, 1]
+                for _, data in enumerate(self.train_dataloader, 0):
+                    inputs, target, delta_tilde_tmp = [d.to(self.device) for d in data]
+                    event, time = target[:, 0], target[:, 1]
 
-                # Sort the batch by the time variable
-                sort_indices = torch.argsort(time)
-                inputs = inputs[sort_indices]
-                event = event[sort_indices]
-                time = time[sort_indices]
-                delta_tilde_tmp = delta_tilde_tmp[sort_indices]
+                    # Sort the batch by the time variable
+                    sort_indices = torch.argsort(time)
+                    inputs = inputs[sort_indices]
+                    event = event[sort_indices]
+                    time = time[sort_indices]
+                    delta_tilde_tmp = delta_tilde_tmp[sort_indices]
 
-                self.optimizer.zero_grad()
-                outputs = self.model(inputs).view(-1)
-                loss = self.metrics(log_h = outputs, time=time, event=event, eta=eta, risk_scores=delta_tilde_tmp)
+                    self.optimizer.zero_grad()
+                    outputs = self.model(inputs).view(-1)
+                    loss = self.metrics(
+                        log_h=outputs,
+                        time=time,
+                        event=event,
+                        eta=eta,
+                        risk_scores=delta_tilde_tmp,
+                        alpha=alpha,
+                        ridge_lambda=ridge_lambda,
+                        model=self.model
+                    )
 
-                if loss != torch.tensor(0.):
-                    loss.backward()
-                    self.optimizer.step()
+                    if loss != torch.tensor(0.):
+                        loss.backward()
+                        self.optimizer.step()
+                    
+                    running_loss += loss.item()
                 
-                running_loss += loss.item()
-            
-            
-            train_loss_list.append(running_loss / len(self.train_dataloader))  # Normalize by number of batches
+                
+                train_loss_list.append(running_loss / len(self.train_dataloader))  # Normalize by number of batches
 
-            if val_set is not None: 
-                val_loss = self.evaluate(eta = eta)
+                val_loss = float('nan')
+                if val_set is not None: 
+                    val_loss = self.evaluate(eta=eta, alpha=alpha, ridge_lambda=ridge_lambda)
 
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
-                    patience_counter = 0
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+                    
+                    if early_stopping and patience_counter >= patience:
+                        print(f'Stopping early at epoch {epoch+1}')
+                        if best_state is not None: # restore the best model
+                            self.model.load_state_dict(best_state)
+                        break
+                    elif not early_stopping and patience_counter >= patience:
+                        if not early_stopping_message_printed:
+                            print(f'Early stopping is not enabled. Should stop early at epoch {epoch+1}')
+                            early_stopping_message_printed = True
+                            early_stopping_epoch = epoch + 1
+                    
+                    val_loss_list.append(val_loss)
+
+                if val_set is not None:
+                    print(f"loss for epoch {epoch} with eta {eta}: {running_loss / len(self.train_dataloader):.3f}, val_loss: {val_loss:.3f}")
                 else:
-                    patience_counter += 1
-                
-                if early_stopping and patience_counter >= patience:
-                    print(f'Stopping early at epoch {epoch+1}')
-                    if best_state is not None: # restore the best model
-                        self.model.load_state_dict(best_state)
-                    break
-                elif not early_stopping and patience_counter >= patience:
-                    if not early_stopping_message_printed:
-                        print(f'Early stopping is not enabled. Should stop early at epoch {epoch+1}')
-                        early_stopping_message_printed = True
-                        early_stopping_epoch = epoch + 1
-                
-                val_loss_list.append(val_loss)
-                
-            print(f"loss for epoch {epoch} with eta {eta}: {running_loss / len(self.train_dataloader):.3f}, val_loss: {val_loss:.3f}")
+                    print(f"loss for epoch {epoch} with eta {eta}: {running_loss / len(self.train_dataloader):.3f}")
 
-            if eval_c_index:
-                _, c_index_train, c_index_val = self.evaluate(eta = 0, eval_c_index=eval_c_index)
-                c_index_train_list.append(c_index_train)
-                c_index_val_list.append(c_index_val)
+                if eval_c_index:
+                    _, c_index_train, c_index_val = self.evaluate(eta = 0, eval_c_index=eval_c_index)
+                    c_index_train_list.append(c_index_train)
+                    c_index_val_list.append(c_index_val)
 
-                if test_set is not None and (epoch + 1) % eval_interval == 0:
-                    c_index_test, loss_test = self.evaluate_test()
-                    print(f'Epoch {epoch+1}, C-index on test set: {c_index_test}')
-                    print(f'Epoch {epoch+1}, Loss on test set: {loss_test}')
-                    c_index_test_list.append((epoch + 1, c_index_test))  # Store epoch and C-index
-                    loss_test_list.append((epoch + 1, loss_test))  # Store epoch and loss
-            
-            if self.scheduler is not None:
-                self.scheduler.step()
+                    if test_set is not None and (epoch + 1) % eval_interval == 0:
+                        c_index_test, loss_test = self.evaluate_test()
+                        print(f'Epoch {epoch+1}, C-index on test set: {c_index_test}')
+                        print(f'Epoch {epoch+1}, Loss on test set: {loss_test}')
+                        c_index_test_list.append((epoch + 1, c_index_test))  # Store epoch and C-index
+                        loss_test_list.append((epoch + 1, loss_test))  # Store epoch and loss
+                
+                if self.scheduler is not None:
+                    self.scheduler.step()
+        finally:
+            if ridge_lambda > 0.0:
+                for param_group, wd in zip(self.optimizer.param_groups, original_weight_decay):
+                    param_group['weight_decay'] = wd
 
         if eval_c_index:
             return train_loss_list, val_loss_list, c_index_train_list, c_index_val_list, c_index_test_list, loss_test_list, early_stopping_epoch
         return train_loss_list, val_loss_list
 
-    def evaluate(self, eta, val=False, eval_c_index=False):
+    def evaluate(self, eta, val=False, eval_c_index=False, alpha=1.0, ridge_lambda=0.0):
         self.model.eval()
         dataloader = self.val_dataloader
         val_loss = 0.0
@@ -613,7 +658,16 @@ class Trainer:
                 delta_tilde_tmp = delta_tilde_tmp[sort_indices]
 
                 outputs = self.model(inputs).view(-1)
-                loss = self.metrics(outputs, time=time, event=event, eta=eta, risk_scores=delta_tilde_tmp)
+                loss = self.metrics(
+                    outputs,
+                    time=time,
+                    event=event,
+                    eta=eta,
+                    risk_scores=delta_tilde_tmp,
+                    alpha=alpha,
+                    ridge_lambda=ridge_lambda,
+                    model=self.model
+                )
                 val_loss += loss.item()
 
                 if eval_c_index:
